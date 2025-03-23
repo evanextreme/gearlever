@@ -4,6 +4,7 @@ import shutil
 import os
 import re
 import json
+import platform
 from typing import Optional, Callable
 from abc import ABC, abstractmethod
 from gi.repository import GLib
@@ -45,7 +46,7 @@ class UpdateManager(ABC):
 
 class UpdateManagerChecker():
     def get_models() -> list[UpdateManager]:
-        return [StaticFileUpdater, GithubUpdater]
+        return [StaticFileUpdater, DynamicUpdater, GithubUpdater]
 
     def get_model_by_name(manager_label: str) -> Optional[UpdateManager]:
         item = list(filter(lambda m: m.name == manager_label, 
@@ -225,6 +226,152 @@ class StaticFileUpdater(UpdateManager):
                 logging.error(str(e))
         
         return headers
+
+class DynamicUpdater(StaticFileUpdater):
+    label = _('Dynamic URL')
+    name = 'DynamicUpdater'
+
+    def __init__(self, url, embedded=False) -> None:
+        self.original_url = url
+        self.embedded = embedded
+        # Resolve dynamic URL to static URL
+        static_url = self.get_static_url(url)
+        # Initialize the parent class with the resolved static URL
+        super().__init__(static_url, embedded) if static_url else super().__init__(url, embedded)
+        # Keep track of both URLs
+        self.dynamic_url = url
+
+    def get_static_url(self, url) -> str:
+        static_url = ''
+        headers = {
+            'User-Agent': DynamicUpdater.get_user_agent(),
+            'Accept': 'application/octet-stream,application/x-appimage,*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': url,
+        }
+        try:
+            logging.debug(f"Attempting to resolve dynamic URL: {url}")
+            resp = requests.get(url, allow_redirects=True, headers=headers)
+            resp.raise_for_status()
+
+            logging.debug(f"Response status: {resp.status_code}")
+            logging.debug(f"Response headers: {resp.headers}")
+
+            # First check for Location header (redirect)
+            static_url = resp.headers.get("location")
+
+            # If no location header, check if we were redirected
+            if not static_url and resp.url != url:
+                static_url = resp.url
+                logging.debug(f"Using final URL after redirect: {static_url}")
+
+            # If still no URL, check Content-Disposition header
+            if not static_url:
+                content_disp = resp.headers.get("content-disposition", "")
+                if "filename=" in content_disp:
+                    # This is likely a direct download link
+                    static_url = url
+                    logging.debug(f"Using original URL as it has Content-Disposition: {content_disp}")
+
+            if not static_url:
+                logging.error(f"Could not extract download URL from response")
+            else:
+                logging.debug(f"Resolved to static URL: {static_url}")
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed: {str(e)}")
+        except Exception as e:
+            logging.error(f"An unexpected error occurred: {str(e)}")
+        return static_url
+
+    @staticmethod
+    def can_handle_link(url: str) -> bool:
+        try:
+            # First check if URL contains obvious AppImage indicators
+            if '.appimage' in url.lower() or 'appimage' in url.lower():
+                logging.debug(f"URL appears to be an AppImage link: {url}")
+                return True
+
+            # Check with HEAD request
+            headers = {
+                'User-Agent': DynamicUpdater.get_user_agent(),
+                'Accept': 'application/octet-stream,application/x-appimage,*/*',
+            }
+
+            try:
+                resp = requests.head(url, allow_redirects=True, headers=headers, timeout=5)
+
+                # Check Content-Type
+                content_type = resp.headers.get('content-type', '').lower()
+                if content_type in ['application/octet-stream', 'application/x-appimage', 'binary/octet-stream']:
+                    logging.debug(f"Content-Type suggests AppImage: {content_type}")
+                    return True
+
+                # Check Content-Disposition
+                content_disp = resp.headers.get('content-disposition', '').lower()
+                if 'appimage' in content_disp:
+                    logging.debug(f"Content-Disposition suggests AppImage: {content_disp}")
+                    return True
+
+                # Don't reject yet - some download pages don't reveal file type in headers
+            except Exception as e:
+                logging.debug(f"HEAD request failed, trying fallback detection: {str(e)}")
+
+            # Fallback: look for common download page patterns
+            common_download_domains = [
+                'download.', '.releases.', 'releases.', 'github.com',
+                'gitlab.', 'sourceforge.net', 'dl.', '.io/download'
+            ]
+
+            for domain in common_download_domains:
+                if domain in url.lower():
+                    logging.debug(f"URL appears to be a download page: {url}")
+                    return True
+
+            logging.debug(f"URL doesn't appear to be an AppImage download: {url}")
+            return False
+
+        except Exception as e:
+            logging.error(f"Error checking if can handle link: {str(e)}")
+            return False
+
+    def download(self, status_update_cb) -> tuple[str, str]:
+        # If URL failed to resolve initially, try one more time
+        if not self.url or self.url == self.original_url:
+            static_url = self.get_static_url(self.original_url)
+            if static_url:
+                self.url = static_url
+                logging.debug(f"Resolved URL before download: {static_url}")
+        
+        # Use parent class's download method
+        return super().download(status_update_cb)
+
+    def is_update_available(self, el: AppImageListElement) -> bool:
+        # Always refresh the static URL when checking for updates
+        fresh_static_url = self.get_static_url(self.original_url)
+        
+        # If URL has changed, update is available
+        if fresh_static_url and fresh_static_url != self.url:
+            logging.debug(f"Static URL has changed: {self.url} -> {fresh_static_url}")
+            self.url = fresh_static_url
+            return True
+            
+        # Otherwise use parent method to check
+        return super().is_update_available(el)
+
+    @staticmethod
+    def get_url_headers(url):
+        url_headers = StaticFileUpdater.get_url_headers(url)
+        url_headers["User-Agent"] = DynamicUpdater.get_user_agent()
+        url_headers["Accept"] = "application/octet-stream,application/x-appimage,*/*"
+        url_headers["Accept-Language"] = "en-US,en;q=0.9"
+        return url_headers
+
+    @staticmethod
+    def get_user_agent():
+        arch = platform.machine()
+        # More realistic, modern browser user agent
+        return f"Mozilla/5.0 (X11; Linux {arch}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
 
 class GithubUpdater(UpdateManager):
     staticfile_manager: Optional[StaticFileUpdater]
